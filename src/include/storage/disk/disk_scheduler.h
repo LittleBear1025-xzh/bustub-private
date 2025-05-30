@@ -15,6 +15,7 @@
 #include <future>  // NOLINT
 #include <optional>
 #include <thread>  // NOLINT
+#include <utility>
 
 #include "common/channel.h"
 #include "storage/disk/disk_manager.h"

@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <limits>
 #include <list>
 #include <mutex>  // NOLINT
@@ -27,14 +28,37 @@ namespace bustub {
 enum class AccessType { Unknown = 0, Lookup, Scan, Index };
 
 class LRUKNode {
+ public:
+  void SetEvictable(bool set_evictable) { this->is_evictable_ = set_evictable; }
+  bool IsEvictable() const { return is_evictable_; }
+
+  /**
+   * @return the history's size before add timestamp
+   * */
+  size_t AddTimestamp(size_t timestamp) {
+    size_t old_size = history_.size();
+    if (old_size >= k_) {
+      history_.pop_back();
+    }
+    history_.emplace_front(timestamp);
+    return old_size;
+  }
+
+  frame_id_t GetFrameId() const { return fid_; }
+  size_t GetHistorySize() const { return history_.size(); }
+  size_t GetKthHistory() const { return history_.back(); }
+
+  LRUKNode() {}
+  LRUKNode(size_t k, frame_id_t fid) : k_(k), fid_(fid) {}
+
  private:
   /** History of last seen K timestamps of this page. Least recent timestamp stored in front. */
   // Remove maybe_unused if you start using them. Feel free to change the member variables as you want.
 
-  [[maybe_unused]] std::list<size_t> history_;
-  [[maybe_unused]] size_t k_;
-  [[maybe_unused]] frame_id_t fid_;
-  [[maybe_unused]] bool is_evictable_{false};
+  std::list<size_t> history_;
+  size_t k_;
+  frame_id_t fid_;
+  bool is_evictable_{false};
 };
 
 /**
@@ -74,12 +98,17 @@ class LRUKReplacer {
  private:
   // TODO(student): implement me! You can replace these member variables as you like.
   // Remove maybe_unused if you start using them.
-  [[maybe_unused]] std::unordered_map<frame_id_t, LRUKNode> node_store_;
-  [[maybe_unused]] size_t current_timestamp_{0};
-  [[maybe_unused]] size_t curr_size_{0};
-  [[maybe_unused]] size_t replacer_size_;
-  [[maybe_unused]] size_t k_;
-  [[maybe_unused]] std::mutex latch_;
+  std::unordered_map<frame_id_t, LRUKNode> node_store_;
+  std::list<frame_id_t> less_k_node_list_;
+  std::list<frame_id_t> more_k_node_list_;
+
+  std::unordered_map<frame_id_t, std::list<frame_id_t>::iterator> less_k_node_map_;
+  std::unordered_map<frame_id_t, std::list<frame_id_t>::iterator> more_k_node_map_;
+  size_t current_timestamp_{0};
+  size_t curr_size_{0};
+  size_t replacer_size_;
+  size_t k_;
+  std::mutex latch_;
 };
 
 }  // namespace bustub

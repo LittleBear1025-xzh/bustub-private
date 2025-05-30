@@ -11,7 +11,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "storage/page/page_guard.h"
+#include <algorithm>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <utility>
+#include "common/config.h"
 
 namespace bustub {
 
@@ -148,6 +153,17 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
       bpm_latch_(std::move(bpm_latch)),
       disk_scheduler_(std::move(disk_scheduler)) {
   UNIMPLEMENTED("TODO(P1): Add implementation.");
+  // TODO: 因为这里创建了一个新的对象来操作 FrameHeader，因此 pin_count_ 需要自增，
+  // 同时由于对象现在持有了这个 frame，所以这个 frame 不能被 Evict
+
+  // 这里加锁是因为防止有其他线程修改 frame 和 replacer
+  std::unique_lock<std::mutex> bpm_lock(*bpm_latch_, std::adopt_lock);
+  frame_->pin_count_.fetch_add(1);
+  replacer_->SetEvictable(frame_->frame_id_, false);
+  // 这里可以放心解锁，因为 frame 被设置为不可 evictable ，不会被修改
+  bpm_lock.unlock();
+  // 获取写锁
+  frame_->rwlatch_.lock();
 }
 
 /**
@@ -165,7 +181,19 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
  *
  * @param that The other page guard.
  */
-WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {}
+WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {
+  if (this != &that) {
+    this->Drop();
+    page_id_ = that.page_id_;
+    frame_ = std::exchange(that.frame_, nullptr);
+    replacer_ = std::exchange(that.replacer_, nullptr);
+    bpm_latch_ = std::exchange(that.bpm_latch_, nullptr);
+    disk_scheduler_ = std::exchange(that.disk_scheduler_, nullptr);
+    is_valid_ = that.is_valid_;
+    that.is_valid_ = false;
+    that.page_id_ = INVALID_PAGE_ID;
+  }
+}
 
 /**
  * @brief The move assignment operator for `WritePageGuard`.
@@ -236,7 +264,17 @@ void WritePageGuard::Flush() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
  *
  * TODO(P1): Add implementation.
  */
-void WritePageGuard::Drop() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void WritePageGuard::Drop() {
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  if (is_valid_) {
+    frame_->pin_count_.fetch_sub(1);
+    is_valid_ = false;
+    if (frame_->pin_count_.load() == 0) {
+      replacer_->SetEvictable(frame_->frame_id_, true);
+    }
+    frame_->rwlatch_.unlock();
+  }
+}
 
 /** @brief The destructor for `WritePageGuard`. This destructor simply calls `Drop()`. */
 WritePageGuard::~WritePageGuard() { Drop(); }

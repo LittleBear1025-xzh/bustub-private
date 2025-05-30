@@ -11,7 +11,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "buffer/lru_k_replacer.h"
+#include <climits>
+#include <cstddef>
+#include <iterator>
+#include <list>
+#include <mutex>
+#include <optional>
+#include <utility>
+#include "common/config.h"
 #include "common/exception.h"
+#include "common/logger.h"
 
 namespace bustub {
 
@@ -37,9 +46,43 @@ LRUKReplacer::LRUKReplacer(size_t num_frames, size_t k) : replacer_size_(num_fra
  * Successful eviction of a frame should decrement the size of replacer and remove the frame's
  * access history.
  *
- * @return true if a frame is evicted successfully, false if no frames can be evicted.
+ * @return frame_id if a frame is evicted successfully, nullopt if no frames can be evicted.
  */
-auto LRUKReplacer::Evict() -> std::optional<frame_id_t> { return std::nullopt; }
+auto LRUKReplacer::Evict() -> std::optional<frame_id_t> {
+  std::unique_lock<std::mutex> lock(latch_);
+  current_timestamp_ += 1;
+
+  if (curr_size_ == 0) {
+    return std::nullopt;
+  }
+
+  auto traverse_remove = [&lock, this](std::list<frame_id_t> &node_list) -> std::optional<frame_id_t> {
+    if (!node_list.empty()) {
+      for (auto frame_id : node_list) {
+        LRUKNode *lru_k_node = &node_store_[frame_id];
+        LOG_INFO("frame id : %d, evictable: %d", frame_id, lru_k_node->IsEvictable());
+        if (lru_k_node->IsEvictable()) {
+          lock.unlock();
+          Remove(frame_id);
+          lock.lock();
+          return frame_id;
+        }
+      }
+    }
+    LOG_INFO("node list is empty or no frame can be evicted");
+    return std::nullopt;
+  };
+
+  LOG_INFO("traversing less k node list...");
+  std::optional<frame_id_t> res = traverse_remove(less_k_node_list_);
+  if (res.has_value()) {
+    return res;
+  }
+
+  LOG_INFO("traversing more k node list...");
+  res = traverse_remove(more_k_node_list_);
+  return res;
+}
 
 /**
  * TODO(P1): Add implementation
@@ -54,7 +97,50 @@ auto LRUKReplacer::Evict() -> std::optional<frame_id_t> { return std::nullopt; }
  * @param access_type type of access that was received. This parameter is only needed for
  * leaderboard tests.
  */
-void LRUKReplacer::RecordAccess(frame_id_t frame_id, [[maybe_unused]] AccessType access_type) {}
+void LRUKReplacer::RecordAccess(frame_id_t frame_id, [[maybe_unused]] AccessType access_type) {
+  LOG_INFO("RecordAccess(frame_id: %d)", frame_id);
+  LOG_INFO("currnet more_k_node_list_:");
+  for (auto temp_frame_id : more_k_node_list_) {
+    LOG_INFO("%d", temp_frame_id);
+  }
+  std::unique_lock<std::mutex> lock(latch_);
+  current_timestamp_ += 1;
+  if (node_store_.find(frame_id) == node_store_.end()) {
+    LRUKNode new_node(k_, frame_id);
+    new_node.AddTimestamp(current_timestamp_);
+    if (curr_size_ == replacer_size_) {
+      lock.unlock();
+      Evict();
+      lock.lock();
+    }
+    node_store_.emplace(frame_id, new_node);
+    less_k_node_list_.emplace_back(frame_id);
+    less_k_node_map_[frame_id] = std::prev(less_k_node_list_.end());
+  } else {
+    LRUKNode *lru_k_node = &node_store_[frame_id];
+    size_t old_size = lru_k_node->AddTimestamp(current_timestamp_);
+    if (old_size < k_ - 1) {
+      less_k_node_list_.erase(less_k_node_map_[frame_id]);
+      less_k_node_list_.emplace_back(frame_id);
+      less_k_node_map_[frame_id] = std::prev(less_k_node_list_.end());
+    } else {
+      if (old_size == k_ - 1) {
+        less_k_node_list_.erase(less_k_node_map_[frame_id]);
+        less_k_node_map_.erase(frame_id);
+      } else {
+        more_k_node_list_.erase(more_k_node_map_[frame_id]);
+      }
+      auto it = more_k_node_list_.begin();
+      while (it != more_k_node_list_.end() &&
+             node_store_[*it].GetKthHistory() <= node_store_[frame_id].GetKthHistory()) {
+        LOG_INFO("frame id: %d, k-th: %zu < frame id: %d, k-th: %zu", *it, node_store_[*it].GetKthHistory(), frame_id,
+                 node_store_[frame_id].GetKthHistory());
+        it++;
+      }
+      more_k_node_map_[frame_id] = more_k_node_list_.insert(it, frame_id);
+    }
+  }
+}
 
 /**
  * TODO(P1): Add implementation
@@ -73,7 +159,19 @@ void LRUKReplacer::RecordAccess(frame_id_t frame_id, [[maybe_unused]] AccessType
  * @param frame_id id of frame whose 'evictable' status will be modified
  * @param set_evictable whether the given frame is evictable or not
  */
-void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {}
+void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
+  std::lock_guard<std::mutex> lock(latch_);
+  current_timestamp_ += 1;
+
+  if (node_store_.find(frame_id) == node_store_.end()) return;
+
+  LRUKNode *lru_k_node = &node_store_[frame_id];
+
+  if (lru_k_node->IsEvictable() != set_evictable) {
+    curr_size_ += (set_evictable ? 1 : -1);
+  }
+  lru_k_node->SetEvictable(set_evictable);
+}
 
 /**
  * TODO(P1): Add implementation
@@ -92,7 +190,27 @@ void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {}
  *
  * @param frame_id id of frame to be removed
  */
-void LRUKReplacer::Remove(frame_id_t frame_id) {}
+void LRUKReplacer::Remove(frame_id_t frame_id) {
+  std::lock_guard<std::mutex> lock(latch_);
+  current_timestamp_ += 1;
+
+  if (node_store_.find(frame_id) == node_store_.end()) return;
+
+  LRUKNode *lru_k_node = &node_store_[frame_id];
+
+  if (!lru_k_node->IsEvictable()) return;
+
+  if (lru_k_node->GetHistorySize() < k_) {
+    less_k_node_list_.erase(less_k_node_map_[frame_id]);
+    less_k_node_map_.erase(frame_id);
+  } else {
+    more_k_node_list_.erase(more_k_node_map_[frame_id]);
+    more_k_node_map_.erase(frame_id);
+  }
+
+  node_store_.erase(frame_id);
+  curr_size_ -= 1;
+}
 
 /**
  * TODO(P1): Add implementation
@@ -101,6 +219,9 @@ void LRUKReplacer::Remove(frame_id_t frame_id) {}
  *
  * @return size_t
  */
-auto LRUKReplacer::Size() -> size_t { return 0; }
+auto LRUKReplacer::Size() -> size_t {
+  std::lock_guard<std::mutex> lock(latch_);
+  return curr_size_;
+}
 
 }  // namespace bustub
