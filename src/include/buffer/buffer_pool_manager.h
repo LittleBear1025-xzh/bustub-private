@@ -14,6 +14,7 @@
 
 #include <list>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -95,6 +96,7 @@ class FrameHeader {
    * currently storing. This might allow you to skip searching for the corresponding (page ID, frame ID) pair somewhere
    * else in the buffer pool manager...
    */
+  page_id_t page_id;
 };
 
 /**
@@ -172,5 +174,8 @@ class BufferPoolManager {
    * stored inside of it. Additionally, you may also want to implement a helper function that returns either a shared
    * pointer to a `FrameHeader` that already has a page's data stored inside of it, or an index to said `FrameHeader`.
    */
+  bool SubmitDiskRequestAndWait(bool is_write, char *data, page_id_t page_id);
+
+  auto AllocateFrameForPage(page_id_t page_id) -> std::optional<frame_id_t>;
 };
 }  // namespace bustub

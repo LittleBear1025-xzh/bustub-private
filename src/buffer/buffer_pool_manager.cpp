@@ -14,9 +14,13 @@
 #include <regex.h>
 #include <algorithm>
 #include <atomic>
+#include <future>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
+#include <shared_mutex>
 #include <type_traits>
 #include <utility>
 #include "buffer/lru_k_replacer.h"
@@ -58,6 +62,7 @@ void FrameHeader::Reset() {
   std::fill(data_.begin(), data_.end(), 0);
   pin_count_.store(0);
   is_dirty_ = false;
+  page_id = INVALID_PAGE_ID;
 }
 
 /**
@@ -132,22 +137,7 @@ auto BufferPoolManager::Size() const -> size_t { return num_frames_; }
  */
 auto BufferPoolManager::NewPage() -> page_id_t {
   page_id_t new_page_id = next_page_id_.fetch_add(1, std::memory_order_relaxed);
-
-  // 上锁
-  std::lock_guard<std::mutex> lock(*bpm_latch_);
-
-  if (!free_frames_.empty()) {
-    frame_id_t new_frame_id = free_frames_.front();
-    page_table_[new_page_id] = new_frame_id;
-    free_frames_.pop_front();
-  } else {
-    std::optional<frame_id_t> opt_frame_id = replacer_->Evict();
-    if (opt_frame_id.has_value()) {
-      page_table_[new_page_id] = opt_frame_id.value();
-    } else {
-      LOG_ERROR("Failed to evict frame");
-    }
-  }
+  // TODO: 这里本来应该在磁盘中申请一块空间给 new_page_id 但是目前实现这个功能的函数，暂时不实现
 
   return new_page_id;
 }
@@ -186,6 +176,58 @@ auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
   disk_scheduler_->DeallocatePage(page_id);
 
   return true;
+}
+
+bool BufferPoolManager::SubmitDiskRequestAndWait(bool is_write, char *data, page_id_t page_id) {
+  auto promise = disk_scheduler_->CreatePromise();
+  std::future<bool> future = promise.get_future();
+  disk_scheduler_->Schedule({is_write, data, page_id, std::move(promise)});
+  try {
+    bool success = future.get();
+    if (success) {
+      LOG_INFO("Disk operation succeeded for page_id: %d, operation: %s", page_id, is_write ? "write" : "read");
+    } else {
+      LOG_ERROR("Disk operation failed for page_id: %d, operation: %s", page_id, is_write ? "write" : "read");
+    }
+    return success;
+  } catch (const std::exception &e) {
+    LOG_ERROR("Exception during disk operation for page_id: %d: %s", page_id, e.what());
+    return false;
+  }
+}
+
+auto BufferPoolManager::AllocateFrameForPage(page_id_t page_id) -> std::optional<frame_id_t> {
+  // 如果page已经存在于frame中，则直接创建一个 WritePageGuard 即可
+  frame_id_t frame_id;
+  if (page_table_.find(page_id) != page_table_.end()) {
+    frame_id = page_table_[page_id];
+  } else if (!free_frames_.empty()) {  // 如果还有足够的空间，则直接分配一个新的frame给page
+    frame_id = free_frames_.front();
+    free_frames_.pop_front();
+    frames_[frame_id]->page_id = page_id;
+    page_table_.insert_or_assign(page_id, frame_id);
+
+    // 如果这个page中还有数据，那还需要读取数据并写入frame中
+    if (!SubmitDiskRequestAndWait(false, frames_[frame_id]->GetDataMut(), page_id)) {
+      LOG_ERROR("读取数据失败");
+    }
+  } else if (auto frame_id_opt = replacer_->Evict(); frame_id_opt.has_value()) {
+    // 调用 LRUKReplacer 的 Evict 函数，淘汰一个page，并把新的page换上去
+    frame_id = frame_id_opt.value();
+    auto frame_header = frames_[frame_id];
+    // 把 frame 中的内容写到磁盘上去，然后把 page_id 中的内容写入内存
+    SubmitDiskRequestAndWait(true, frame_header->GetDataMut(), frame_header->page_id);
+
+    // 删除 page_table 对老 page_id 的映射，同时将新的 page_id 与 frame_header 映射起来
+    page_table_.erase(frame_header->page_id);
+    frame_header->Reset();
+    frame_header->page_id = page_id;
+    page_table_.insert_or_assign(page_id, frame_id);
+
+  } else {
+    return std::nullopt;
+  }
+  return frame_id;
 }
 
 /**
@@ -233,29 +275,11 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
   // 先这样写，等到测试有问题再改
   std::lock_guard<std::mutex> lock(*bpm_latch_);
 
-  frame_id_t frame_id;
-
-  // 如果page已经存在于frame中，则直接创建一个 WritePageGuard 即可
-  if (page_table_.find(page_id) != page_table_.end()) {
-    frame_id = page_table_[page_id];
-  } else if (!free_frames_.empty()) {  // 如果还有足够的空间，则直接分配一个新的frame给page
-    frame_id = free_frames_.front();
-    free_frames_.pop_front();
-    page_table_.insert_or_assign(page_id, frame_id);
-  } else if (auto frame_id_opt = replacer_->Evict(); frame_id_opt.has_value()) {
-    // 调用 LRUKReplacer 的 Evict 函数，淘汰一个page，并把新的page换上去
-    frame_id = frame_id_opt.value();
-    // TODO: 可能要把 frame 中的内容写到磁盘上去，然后把 page_id 中的内容写入内存
-    frames_[frame_id]->Reset();
-    page_table_.insert_or_assign(page_id, frame_id);
-  } else {
-    return std::nullopt;
+  std::optional<frame_id_t> frame_id_opt = AllocateFrameForPage(page_id);
+  if (frame_id_opt.has_value()) {
+    return WritePageGuard(page_id, frames_[frame_id_opt.value()], replacer_, bpm_latch_, disk_scheduler_);
   }
-
-  // BUG: 需要修改 pin_count_ 的值，这里要加锁进行操作
-  // frames_[frame_id]->pin_count_ += 1;
-
-  return WritePageGuard(page_id, frames_[frame_id], replacer_, bpm_latch_, disk_scheduler_);
+  return std::nullopt;
 }
 
 /**
@@ -283,9 +307,16 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
  * returns `std::nullopt`, otherwise returns a `ReadPageGuard` ensuring shared and read-only access to a page's data.
  */
 auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_type) -> std::optional<ReadPageGuard> {
-  UNIMPLEMENTED("TODO(P1): Add implementation.");
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
   // TODO: 看题解说这里好像涉及各种锁的切换已经频繁使用 move 目前还没有遇到这种情况，
   // 先这样写，等到测试有问题再改
+  std::lock_guard<std::mutex> lock(*bpm_latch_);
+
+  std::optional<frame_id_t> frame_id_opt = AllocateFrameForPage(page_id);
+  if (frame_id_opt.has_value()) {
+    return ReadPageGuard(page_id, frames_[frame_id_opt.value()], replacer_, bpm_latch_, disk_scheduler_);
+  }
+  return std::nullopt;
 }
 
 /**
@@ -359,20 +390,20 @@ auto BufferPoolManager::ReadPage(page_id_t page_id, AccessType access_type) -> R
  */
 auto BufferPoolManager::FlushPageUnsafe(page_id_t page_id) -> bool {
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  // 依靠外部加锁，这个函数无需加锁，直接对frame操作即可
   // 先判断页面是否存在内存中
   if (page_table_.find(page_id) == page_table_.end()) {
     return false;
   }
 
-  std::shared_ptr<FrameHeader> frame_header = frames_[page_table_[page_id]];
+  auto frame = frames_[page_table_[page_id]];
 
-  if (frame_header->is_dirty_) {
-    auto write_page_opt = CheckedWritePage(page_id);
-
-    if (write_page_opt.has_value()) {
-      WritePageGuard write_page = std::move(write_page_opt).value();
-      write_page.Flush();
-    }
+  if (frame->is_dirty_) {
+    auto promise = disk_scheduler_->CreatePromise();
+    std::future<bool> future = promise.get_future();
+    disk_scheduler_->Schedule({true, frame->GetDataMut(), page_id, std::move(promise)});
+    frame->is_dirty_ = false;
+    return future.get();
   }
   return true;
 }
@@ -395,7 +426,15 @@ auto BufferPoolManager::FlushPageUnsafe(page_id_t page_id) -> bool {
  * @param page_id The page ID of the page to be flushed.
  * @return `false` if the page could not be found in the page table, otherwise `true`.
  */
-auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  auto write_page_guard = CheckedWritePage(page_id);
+
+  if (!write_page_guard) return false;
+
+  write_page_guard->Flush();
+  return true;
+}
 
 /**
  * @brief Flushes all page data that is in memory to disk unsafely.
@@ -410,7 +449,13 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool { UNIMPLEMENTED("TO
  *
  * TODO(P1): Add implementation
  */
-void BufferPoolManager::FlushAllPagesUnsafe() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void BufferPoolManager::FlushAllPagesUnsafe() {
+  // UNIMPLEMENTED("TODO(P1): Add implementation.");
+  std::unique_lock<std::mutex> lock(*bpm_latch_);
+  for (auto &[page_id, _] : page_table_) {
+    FlushPageUnsafe(page_id);
+  }
+}
 
 /**
  * @brief Flushes all page data that is in memory to disk safely.
@@ -424,7 +469,11 @@ void BufferPoolManager::FlushAllPagesUnsafe() { UNIMPLEMENTED("TODO(P1): Add imp
  *
  * TODO(P1): Add implementation
  */
-void BufferPoolManager::FlushAllPages() { UNIMPLEMENTED("TODO(P1): Add implementation."); }
+void BufferPoolManager::FlushAllPages() {
+  for (auto &[page_id, _] : page_table_) {
+    FlushPage(page_id);
+  }
+}
 
 /**
  * @brief Retrieves the pin count of a page. If the page does not exist in memory, return `std::nullopt`.
