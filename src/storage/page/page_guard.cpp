@@ -44,8 +44,7 @@ ReadPageGuard::ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> fra
       disk_scheduler_(std::move(disk_scheduler)) {
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
 
-  std::unique_lock<std::mutex> bpm_lock(*bpm_latch_, std::defer_lock);
-  bpm_lock.try_lock();
+  std::unique_lock<std::mutex> bpm_lock(*bpm_latch_);
   frame_->pin_count_.fetch_add(1);
   replacer_->SetEvictable(frame_->frame_id_, false);
   replacer_->RecordAccess(frame_->frame_id_);
@@ -159,10 +158,14 @@ void ReadPageGuard::Flush() {
 void ReadPageGuard::Drop() {
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
   if (is_valid_) {
-    frame_->pin_count_.fetch_sub(1);
     is_valid_ = false;
-    if (frame_->pin_count_.load() == 0) {
-      replacer_->SetEvictable(frame_->frame_id_, true);
+    read_lock_.unlock();
+    {
+      std::lock_guard<std::mutex> lock(*bpm_latch_);
+      frame_->pin_count_.fetch_sub(1);
+      if (frame_->pin_count_.load() == 0) {
+        replacer_->SetEvictable(frame_->frame_id_, true);
+      }
     }
   }
 }
@@ -198,8 +201,7 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
 
   // 这里加锁是因为防止有其他线程修改 frame 和 replacer
-  std::unique_lock<std::mutex> bpm_lock(*bpm_latch_, std::defer_lock);
-  bpm_lock.try_lock();
+  std::unique_lock<std::mutex> bpm_lock(*bpm_latch_);
   // 因为这里创建了一个新的对象来操作 FrameHeader，因此 pin_count_ 需要自增，
   // 同时由于对象现在持有了这个 frame，所以这个 frame 不能被 Evict
   // 记录frame被访问过一次
@@ -329,10 +331,14 @@ void WritePageGuard::Flush() {
 void WritePageGuard::Drop() {
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
   if (is_valid_) {
-    frame_->pin_count_.fetch_sub(1);
     is_valid_ = false;
-    if (frame_->pin_count_.load() == 0) {
-      replacer_->SetEvictable(frame_->frame_id_, true);
+    write_lock_.unlock();
+    {
+      std::lock_guard<std::mutex> lock(*bpm_latch_);
+      frame_->pin_count_.fetch_sub(1);
+      if (frame_->pin_count_.load() == 0) {
+        replacer_->SetEvictable(frame_->frame_id_, true);
+      }
     }
   }
 }

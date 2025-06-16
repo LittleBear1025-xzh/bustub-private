@@ -27,6 +27,7 @@
 #include "common/config.h"
 #include "common/logger.h"
 #include "fmt/chrono.h"
+#include "libfort/lib/fort.h"
 #include "storage/disk/disk_scheduler.h"
 #include "storage/page/page_guard.h"
 
@@ -136,9 +137,8 @@ auto BufferPoolManager::Size() const -> size_t { return num_frames_; }
  * @return The page ID of the newly allocated page.
  */
 auto BufferPoolManager::NewPage() -> page_id_t {
-  page_id_t new_page_id = next_page_id_.fetch_add(1, std::memory_order_relaxed);
-  // TODO: 这里本来应该在磁盘中申请一块空间给 new_page_id 但是目前实现这个功能的函数，暂时不实现
-
+  page_id_t new_page_id = next_page_id_.fetch_add(1);
+  LOG_INFO("分配一个新的page: %d", new_page_id);
   return new_page_id;
 }
 
@@ -197,11 +197,14 @@ bool BufferPoolManager::SubmitDiskRequestAndWait(bool is_write, char *data, page
 }
 
 auto BufferPoolManager::AllocateFrameForPage(page_id_t page_id) -> std::optional<frame_id_t> {
+  std::lock_guard<std::mutex> lock(*bpm_latch_);
   // 如果page已经存在于frame中，则直接创建一个 WritePageGuard 即可
   frame_id_t frame_id;
   if (page_table_.find(page_id) != page_table_.end()) {
+    // LOG_INFO("page: %d 已经存在于 frame: %d 中，直接返回", page_id, page_table_[page_id]);
     frame_id = page_table_[page_id];
-  } else if (!free_frames_.empty()) {  // 如果还有足够的空间，则直接分配一个新的frame给page
+  } else if (!free_frames_.empty()) {
+    // LOG_INFO("如果还有足够的空间，则直接分配一个新的frame给page");
     frame_id = free_frames_.front();
     free_frames_.pop_front();
     frames_[frame_id]->page_id = page_id;
@@ -212,19 +215,22 @@ auto BufferPoolManager::AllocateFrameForPage(page_id_t page_id) -> std::optional
       LOG_ERROR("读取数据失败");
     }
   } else if (auto frame_id_opt = replacer_->Evict(); frame_id_opt.has_value()) {
-    // 调用 LRUKReplacer 的 Evict 函数，淘汰一个page，并把新的page换上去
+    // LOG_INFO("调用 LRUKReplacer 的 Evict 函数，淘汰一个page，并把新的page换上去");
     frame_id = frame_id_opt.value();
     auto frame_header = frames_[frame_id];
-    // 把 frame 中的内容写到磁盘上去，然后把 page_id 中的内容写入内存
+    LOG_INFO("repalce page: %d to disk, and page: %d to memory", frame_header->page_id, page_id);
+    LOG_INFO("把 frame 中的内容写到磁盘上去，然后把 page_id: %d 中的内容写入内存", page_id);
     SubmitDiskRequestAndWait(true, frame_header->GetDataMut(), frame_header->page_id);
-
     // 删除 page_table 对老 page_id 的映射，同时将新的 page_id 与 frame_header 映射起来
     page_table_.erase(frame_header->page_id);
+
     frame_header->Reset();
     frame_header->page_id = page_id;
     page_table_.insert_or_assign(page_id, frame_id);
+    SubmitDiskRequestAndWait(false, frame_header->GetDataMut(), page_id);
 
   } else {
+    // LOG_INFO("没有可以分配 page: %d 的 frame", page_id);
     return std::nullopt;
   }
   return frame_id;
@@ -273,13 +279,11 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
   // TODO: 看题解说这里好像涉及各种锁的切换已经频繁使用 move 目前还没有遇到这种情况，
   // 先这样写，等到测试有问题再改
-  std::lock_guard<std::mutex> lock(*bpm_latch_);
-
   std::optional<frame_id_t> frame_id_opt = AllocateFrameForPage(page_id);
-  if (frame_id_opt.has_value()) {
-    return WritePageGuard(page_id, frames_[frame_id_opt.value()], replacer_, bpm_latch_, disk_scheduler_);
+  if (!frame_id_opt.has_value()) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  return WritePageGuard(page_id, frames_[frame_id_opt.value()], replacer_, bpm_latch_, disk_scheduler_);
 }
 
 /**
@@ -308,15 +312,11 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
  */
 auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_type) -> std::optional<ReadPageGuard> {
   // UNIMPLEMENTED("TODO(P1): Add implementation.");
-  // TODO: 看题解说这里好像涉及各种锁的切换已经频繁使用 move 目前还没有遇到这种情况，
-  // 先这样写，等到测试有问题再改
-  std::lock_guard<std::mutex> lock(*bpm_latch_);
-
   std::optional<frame_id_t> frame_id_opt = AllocateFrameForPage(page_id);
-  if (frame_id_opt.has_value()) {
-    return ReadPageGuard(page_id, frames_[frame_id_opt.value()], replacer_, bpm_latch_, disk_scheduler_);
+  if (!frame_id_opt.has_value()) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  return ReadPageGuard(page_id, frames_[frame_id_opt.value()], replacer_, bpm_latch_, disk_scheduler_);
 }
 
 /**

@@ -56,32 +56,25 @@ auto LRUKReplacer::Evict() -> std::optional<frame_id_t> {
     return std::nullopt;
   }
 
-  auto traverse_remove = [&lock, this](std::list<frame_id_t> &node_list) -> std::optional<frame_id_t> {
-    if (!node_list.empty()) {
-      for (auto frame_id : node_list) {
-        LRUKNode *lru_k_node = &node_store_[frame_id];
-        LOG_INFO("frame id : %d, evictable: %d", frame_id, lru_k_node->IsEvictable());
-        if (lru_k_node->IsEvictable()) {
-          lock.unlock();
-          Remove(frame_id);
-          lock.lock();
-          return frame_id;
-        }
-      }
+  // 先扫描 less_k_node_list_
+  for (auto frame_id : less_k_node_list_) {
+    auto &node = node_store_[frame_id];
+    if (node.IsEvictable()) {
+      RemoveInternal(frame_id);
+      return frame_id;
     }
-    LOG_INFO("node list is empty or no frame can be evicted");
-    return std::nullopt;
-  };
-
-  LOG_INFO("traversing less k node list...");
-  std::optional<frame_id_t> res = traverse_remove(less_k_node_list_);
-  if (res.has_value()) {
-    return res;
   }
 
-  LOG_INFO("traversing more k node list...");
-  res = traverse_remove(more_k_node_list_);
-  return res;
+  // 再扫描 more_k_node_list_
+  for (auto frame_id : more_k_node_list_) {
+    auto &node = node_store_[frame_id];
+    if (node.IsEvictable()) {
+      RemoveInternal(frame_id);
+      return frame_id;
+    }
+  }
+
+  return std::nullopt;
 }
 
 /**
@@ -98,11 +91,11 @@ auto LRUKReplacer::Evict() -> std::optional<frame_id_t> {
  * leaderboard tests.
  */
 void LRUKReplacer::RecordAccess(frame_id_t frame_id, [[maybe_unused]] AccessType access_type) {
-  LOG_INFO("RecordAccess(frame_id: %d)", frame_id);
-  LOG_INFO("currnet more_k_node_list_:");
-  for (auto temp_frame_id : more_k_node_list_) {
-    LOG_INFO("%d", temp_frame_id);
-  }
+  // LOG_INFO("RecordAccess(frame_id: %d)", frame_id);
+  // LOG_INFO("currnet more_k_node_list_:");
+  // for (auto temp_frame_id : more_k_node_list_) {
+  //   LOG_INFO("%d", temp_frame_id);
+  // }
   std::unique_lock<std::mutex> lock(latch_);
   current_timestamp_ += 1;
   if (node_store_.find(frame_id) == node_store_.end()) {
@@ -133,8 +126,9 @@ void LRUKReplacer::RecordAccess(frame_id_t frame_id, [[maybe_unused]] AccessType
       auto it = more_k_node_list_.begin();
       while (it != more_k_node_list_.end() &&
              node_store_[*it].GetKthHistory() <= node_store_[frame_id].GetKthHistory()) {
-        LOG_INFO("frame id: %d, k-th: %zu < frame id: %d, k-th: %zu", *it, node_store_[*it].GetKthHistory(), frame_id,
-                 node_store_[frame_id].GetKthHistory());
+        // LOG_INFO("frame id: %d, k-th: %zu < frame id: %d, k-th: %zu", *it, node_store_[*it].GetKthHistory(),
+        // frame_id,
+        //          node_store_[frame_id].GetKthHistory());
         it++;
       }
       more_k_node_map_[frame_id] = more_k_node_list_.insert(it, frame_id);
@@ -192,6 +186,10 @@ void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
  */
 void LRUKReplacer::Remove(frame_id_t frame_id) {
   std::lock_guard<std::mutex> lock(latch_);
+  RemoveInternal(frame_id);
+}
+
+void LRUKReplacer::RemoveInternal(frame_id_t frame_id) {
   current_timestamp_ += 1;
 
   if (node_store_.find(frame_id) == node_store_.end()) return;

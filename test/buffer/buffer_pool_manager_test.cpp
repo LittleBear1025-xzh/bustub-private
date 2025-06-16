@@ -14,6 +14,7 @@
 #include <filesystem>
 
 #include "buffer/buffer_pool_manager.h"
+#include "common/logger.h"
 #include "gtest/gtest.h"
 #include "storage/page/page_guard.h"
 
@@ -336,7 +337,9 @@ TEST(BufferPoolManagerTest, DeadlockTest) {
     start.store(true);
 
     // Attempt to write to page 0.
+    LOG_INFO("尝试获取 page 0 的 WritePage");
     const auto guard0 = bpm->WritePage(pid0);
+    LOG_INFO("子线程执行完毕");
   });
 
   // Wait for the other thread to begin before we start the test.
@@ -354,6 +357,7 @@ TEST(BufferPoolManagerTest, DeadlockTest) {
   const auto guard1 = bpm->WritePage(pid1);
 
   // Let the child thread have the page 0 since we're done with it.
+  LOG_INFO("guard0.Drop();");
   guard0.Drop();
 
   child.join();
@@ -402,6 +406,7 @@ TEST(BufferPoolManagerTest, EvictableTest) {
 
     if (i % 2 == 0) {
       // Take the read latch on the page and pin it.
+      LOG_INFO("读");
       auto read_guard = bpm->ReadPage(winner_pid);
 
       // Wake up all of the readers.
@@ -413,6 +418,7 @@ TEST(BufferPoolManagerTest, EvictableTest) {
       read_guard.Drop();
     } else {
       // Take the read latch on the page and pin it.
+      LOG_INFO("写");
       auto write_guard = bpm->WritePage(winner_pid);
 
       // Wake up all of the readers.

@@ -96,6 +96,7 @@ class LRUKReplacer {
   auto Size() -> size_t;
 
  private:
+  void RemoveInternal(frame_id_t frame_id);
   // TODO(student): implement me! You can replace these member variables as you like.
   // Remove maybe_unused if you start using them.
   std::unordered_map<frame_id_t, LRUKNode> node_store_;
