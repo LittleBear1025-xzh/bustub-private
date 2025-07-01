@@ -124,6 +124,21 @@ class BPlusTree {
 
   auto ToPrintableBPlusTree(page_id_t root_id) -> PrintableBPlusTree;
 
+  void InitTree();
+
+  bool InsertInToLeafPage(Context &context, LeafPage *leaf_page, const KeyType &key, const ValueType &value);
+
+  auto FindInsertedLeafPageAndRecordSearchPath(Context &context, const KeyType &key) const -> LeafPage *;
+
+  void InitContext(Context &context);
+
+  void Split(Context &context, LeafPage *old_leaf_page);
+
+  /**
+   * @return 被提上去的Key
+   * */
+  auto SplitLeafNode(LeafPage *old_leaf_page) -> KeyType;
+
   // member variable
   std::string index_name_;
   BufferPoolManager *bpm_;

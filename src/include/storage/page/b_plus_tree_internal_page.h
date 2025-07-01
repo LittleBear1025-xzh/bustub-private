@@ -15,6 +15,8 @@
 #include <queue>
 #include <string>
 
+#include "common/config.h"
+#include "execution/expressions/comparison_expression.h"
 #include "storage/page/b_plus_tree_page.h"
 
 namespace bustub {
@@ -63,6 +65,12 @@ class BPlusTreeInternalPage : public BPlusTreePage {
   auto ValueIndex(const ValueType &value) const -> int;
 
   auto ValueAt(int index) const -> ValueType;
+
+  auto Lookup(const KeyType &key, KeyComparator &comparator) const -> page_id_t;
+
+  auto FindInsertedPage(const KeyType &key, const KeyComparator &comparator) const -> page_id_t;
+
+  bool InsertKey(KeyType &key);
 
   /**
    * @brief For test only, return a string representing all keys in
